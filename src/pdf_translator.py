@@ -66,8 +66,52 @@ def translate_pdf(input_path, output_path, translation, progress_bar=None):
         # Create a new page with the same dimensions as the original
         new_page = translated_pdf.new_page(width=page.rect.width, height=page.rect.height)
         
-        # Let's try an alternative approach - extract text as words which gives better positioning
+        # Get the full page dict that contains all text elements
+        page_dict = page.get_text("dict")
+        
+        # First, handle standalone headers and form-type text (often at the top)
+        for block in page_dict["blocks"]:
+            if "lines" in block:
+                # Look for header-like blocks (typically have fewer lines and larger font)
+                is_header = len(block["lines"]) <= 3  # Headers typically have 1-3 lines
+                
+                for line in block["lines"]:
+                    # Extract and process each text span in the line
+                    for span in line["spans"]:
+                        x0, y0, x1, y1 = span["bbox"]
+                        text = span["text"].strip()
+                        font_size = span["size"]
+                        
+                        # Headers and form fields often have these characteristics
+                        is_form_field = (y0 < page.rect.height * 0.2)  # In top 20% of page
+                        is_standalone = (len(text) < 50)  # Short text
+                        
+                        if text and (is_header or is_form_field or is_standalone):
+                            translated_text = translation.translate(text)
+                            text_count += 1
+                            
+                            # Increase width slightly for headers to accommodate longer translations
+                            width_factor = 1.5 if is_header or is_standalone else 1.2
+                            width = min((x1 - x0) * width_factor, max_text_width)
+                            
+                            # Create a rectangle for the text with some padding
+                            text_rect = fitz.Rect(x0, y0, x0 + width, y1 + 20)
+                            
+                            # Insert the translated text
+                            new_page.insert_textbox(
+                                text_rect,
+                                translated_text,
+                                fontname="helv",
+                                fontsize=font_size,
+                                color=(0, 0, 0),
+                                align=0  # Left-aligned
+                            )
+        
+        # Now process the main content using the word-extraction approach
         words = page.get_text("words")
+        
+        # Track which words we've already processed as headers/form fields
+        processed_positions = set()
         
         # Group words into larger text chunks for better translation
         chunks = []
@@ -78,12 +122,16 @@ def translate_pdf(input_path, output_path, translation, progress_bar=None):
         for word in words:
             x0, y0, x1, y1, text, block_no, line_no, word_no = word
             
+            # Skip words that are part of headers we already processed
+            position_key = f"{x0:.1f}_{y0:.1f}"
+            if position_key in processed_positions:
+                continue
+                
             # If we're on a new line or block and have accumulated text, add it to chunks
             if (last_y != -1 and (abs(y0 - last_y) > 5 or block_no != last_block)) and current_chunk:
                 chunks.append((current_chunk[0][0], current_chunk[0][1], 
                               current_chunk[-1][2], current_chunk[-1][3], 
-                              " ".join(w[4] for w in current_chunk), 
-                              current_chunk[0][5]))  # Include block number for context
+                              " ".join(w[4] for w in current_chunk)))
                 current_chunk = []
             
             current_chunk.append(word)
@@ -94,11 +142,10 @@ def translate_pdf(input_path, output_path, translation, progress_bar=None):
         if current_chunk:
             chunks.append((current_chunk[0][0], current_chunk[0][1], 
                           current_chunk[-1][2], current_chunk[-1][3], 
-                          " ".join(w[4] for w in current_chunk),
-                          current_chunk[0][5]))
+                          " ".join(w[4] for w in current_chunk)))
         
         # Process chunks for translation
-        for x0, y0, x1, y1, text, block_no in chunks:
+        for x0, y0, x1, y1, text in chunks:
             if text.strip():
                 text_count += 1
                 translated_text = translation.translate(text)
@@ -126,7 +173,7 @@ def translate_pdf(input_path, output_path, translation, progress_bar=None):
                 pix = fitz.Pixmap(pdf_document, xref)
                 
                 # Calculate the image position and size (use image bounding box if possible)
-                for block in page.get_text("dict")["blocks"]:
+                for block in page_dict["blocks"]:
                     if "image" in block and block.get("number", -1) == xref:
                         img_rect = fitz.Rect(block["bbox"])
                         new_page.insert_image(img_rect, pixmap=pix)
